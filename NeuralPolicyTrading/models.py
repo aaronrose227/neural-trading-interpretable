@@ -93,29 +93,31 @@ class TradingPolicy(nn.Module):
                  window_short: int,
                  window_long:  int,
                  beta:         float = 10.0,
-                 input_trainable:   bool  = False,
-                 feature_trainable: bool  = True,
-                 logic_trainable:   bool  = False):
+                 input_trainable:   bool  = True,   # now always trainable
+                 feature_trainable: bool  = True):  # now always trainable
         super().__init__()
-        # 1) Submodules
-        self.input_f = InputFeature(window_short, window_long, trainable=input_trainable)
+        # 1) Build submodules
+        self.input_f = InputFeature(window_short,
+                                    window_long,
+                                    trainable=input_trainable)
         self.feat_n  = FeatureNet(trainable=feature_trainable)
-        self.logic   = LogicNet(trainable=logic_trainable)
+        # 2) Logic gates are *always* frozen
+        self.logic   = LogicNet(trainable=False)
         self.policy  = PolicyNet(beta)
 
-        # 2) Random‐init non‐logic parameters only
+        # 3) Random‐init only the trainable parts
         for name, param in self.named_parameters():
             if param.requires_grad and not name.startswith("logic"):
                 nn.init.normal_(param, mean=0.0, std=0.05)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq_len) or (batch, seq_len,1)
         if x.ndim == 3:
             x = x.squeeze(-1)
-        f1 = self.input_f(x)    # (batch,2)
-        f2 = self.feat_n(f1)    # (batch,2)
-        f3 = self.logic(f2)     # (batch,3)
-        return self.policy(f3)  # (batch,3)
+        f1 = self.input_f(x)
+        f2 = self.feat_n(f1)
+        f3 = self.logic(f2)
+        return self.policy(f3)
+
 
 
 

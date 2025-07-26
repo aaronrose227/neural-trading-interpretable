@@ -1,5 +1,4 @@
 import torch
-import math
 import random
 import numpy as np
 import pandas as pd
@@ -11,13 +10,10 @@ torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
 
-# ─── 1. Original Synthetic‐Data Generators ────────────────────────────
+# ─── 1. Synthetic Data Generators (unchanged) ────────────────────────
 WINDOW = 10000
 
-def simulate_ou_standard(mu: torch.Tensor,
-                         theta: float,
-                         sigma: float,
-                         dt: float) -> torch.Tensor:
+def simulate_ou_standard(mu, theta, sigma, dt):
     T = mu.shape[0]
     sqrt_dt = torch.sqrt(torch.tensor(dt))
     P = torch.empty(T)
@@ -28,66 +24,48 @@ def simulate_ou_standard(mu: torch.Tensor,
         P[t] = P[t-1] + drift + diffusion
     return P
 
-def simulate_ou_switching(mu: torch.Tensor,
-                          theta_pos: float,
-                          theta_neg: float,
-                          sigma: float,
-                          dt: float,
-                          switch_interval: int) -> torch.Tensor:
+def simulate_ou_switching(mu, theta_pos, theta_neg, sigma, dt, switch_interval):
     T = mu.shape[0]
     sqrt_dt = torch.sqrt(torch.tensor(dt))
     P = torch.empty(T)
     P[0] = mu[0]
     for t in range(1, T):
-        theta = theta_pos if ((t // switch_interval) % 2) == 0 else theta_neg
-        drift     = theta * (mu[t] - P[t-1]) * dt
+        θ = theta_pos if ((t // switch_interval) % 2) == 0 else theta_neg
+        drift     = θ * (mu[t] - P[t-1]) * dt
         diffusion = sigma * sqrt_dt * torch.randn(())
         P[t] = P[t-1] + drift + diffusion
     return P
 
 def get_data(regime: str) -> pd.DataFrame:
-    """
-    series_type: 'trend', 'flat', or 'switch'
-    returns a DataFrame with column 'Price' of length WINDOW,
-    using your original parameterization.
-    """
-    T      = WINDOW
-    dt     = 1.0 / T
+    T, dt = WINDOW, 1.0/WINDOW
+    trend_rate = 0.01
+    # paper’s params
+    σ_tr, σ_fl, σ_sw = 20.0, 50.0, 10.0
+    θ_tr, θ_fl       = 2.0, 20.0
+    θ_pos, θ_neg     = 7.5, -2.5
+    reglen           = 500
 
-    trend_rate   = 0.01
-    sigma_trend  = 20.0
-    sigma_flat   = 50.0
-    sigma_switch = 10.0
-    theta_trend  = 2.0
-    theta_flat   = 20.0
-    theta_pos    = 7.5
-    theta_neg    = -2.5
-    regime_len   = 500
+    torch.manual_seed(42)
+    mu_tr  = 50.0 + trend_rate * torch.arange(T)
+    mu_fl  = torch.full((T,), 50.0)
+    mu_sw  = mu_tr.clone()
 
-    mu_trend  = 50.0 + trend_rate * torch.arange(T, dtype=torch.float32)
-    mu_flat   = torch.full((T,), 50.0, dtype=torch.float32)
-    mu_switch = mu_trend.clone()
-
-    if regime == 'trend':
-        P = simulate_ou_standard(mu_trend, theta_trend, sigma_trend, dt)
-    elif regime == 'flat':
-        P = simulate_ou_standard(mu_flat, theta_flat, sigma_flat, dt)
-    elif regime == 'switch':
-        P = simulate_ou_switching(mu_switch,
-                                  theta_pos, theta_neg,
-                                  sigma_switch, dt,
-                                  switch_interval=regime_len)
+    if regime=='trend':
+        P = simulate_ou_standard(mu_tr, θ_tr, σ_tr, dt)
+    elif regime=='flat':
+        P = simulate_ou_standard(mu_fl, θ_fl, σ_fl, dt)
+    elif regime=='switch':
+        P = simulate_ou_switching(mu_sw, θ_pos, θ_neg, σ_sw, dt, reglen)
     else:
-        raise ValueError("regime must be 'trend','flat' or 'switch'")
+        raise ValueError
 
     return pd.DataFrame({'Price': P.numpy()})
 
 # ─── 2. Loss ───────────────────────────────────────────────────────────
-def neg_log_return_loss(R: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
-    # sum‐based per paper
+def neg_log_return_loss(R, X):
     return -torch.sum(torch.log(1 + R * X))
 
-# ─── 3. Train Synthetic ────────────────────────────────────────────────
+# ─── 3. Training Routine ───────────────────────────────────────────────
 def train_synthetic(regime: str,
                     window_short: int,
                     window_long:  int,
@@ -109,16 +87,18 @@ def train_synthetic(regime: str,
     returns = torch.tensor(df['return'].values, dtype=torch.float32)
 
     # 2) Indices
-    warmup      = window_long            # 200
-    train_start = warmup                 # idx 200
-    train_end   = train_start + 8000     # idx 8200
+    warmup      = window_long
+    train_start = warmup
+    train_end   = train_start + 8000
 
-    # 3) Build train windows
-    X = torch.stack([
-        prices[i : i + window_long].squeeze(-1)
-        for i in range(train_start, train_end)
-    ], dim=0)                              # (8000, window_long)
-    Y = returns[train_start : train_end]   # (8000,)
+    # 3) Build normalized windows
+    windows = []
+    for i in range(train_start, train_end):
+        raw = prices[i:i+window_long].squeeze(-1)
+        X_norm = (raw - raw.mean()) / (raw.std() + 1e-6)
+        windows.append(X_norm)
+    X = torch.stack(windows, dim=0)             # (8000, window_long)
+    Y = returns[train_start:train_end]          # (8000,)
 
     # 4) Model
     model = TradingPolicy(
@@ -126,22 +106,41 @@ def train_synthetic(regime: str,
         window_long,
         beta=beta,
         input_trainable   = (variant == 'all'),
-        feature_trainable = (variant in ['logic+feature','all']),
-        logic_trainable   = True
+        feature_trainable = (variant in ['logic+feature','all'])
     )
 
-    # 5) Optimizer
-    optimizer = Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    # 5) Optimizer: only if there are trainable params
+    param_groups = [
+        {'params': model.input_f.parameters(), 'lr': 0.01},
+        {'params': model.feat_n.parameters(),  'lr': 0.01},
+    ]
+    param_groups = [g for g in param_groups if any(p.requires_grad for p in g['params'])]
+    optimizer = Adam(param_groups) if param_groups else None
 
-    # 6) Training loop
+    # 6) Optional init prints
+    print("  [Init] lin_short w[0:3]:", model.input_f.lin_short.weight.data.flatten()[:3].tolist())
+    print("         tau1, tau2:", model.feat_n.tau1.item(), model.feat_n.tau2.item())
+
+    # 7) Training loop (skip if no optimizer)
     loss_hist = []
-    for _ in range(epochs):
-        optimizer.zero_grad()
-        logits = model(X)             # (8000,3)
-        pos    = logits[:,1] - logits[:,2]
-        loss   = neg_log_return_loss(Y, pos)
-        loss.backward()
-        optimizer.step()
-        loss_hist.append(loss.item())
+    if optimizer is not None:
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            logits = model(X)                    # (8000,3)
+            pos    = logits[:,1] - logits[:,2]
+            loss   = neg_log_return_loss(Y, pos)
+
+            loss.backward()
+
+            # (you may insert grad‐sum logging here)
+
+            optimizer.step()
+            loss_hist.append(loss.item())
+    else:
+        print("  [Info] No trainable params—skipping training loop for logic‐only variant.")
+
+    # 8) Optional final prints
+    print("  [Final] lin_short w[0:3]:", model.input_f.lin_short.weight.data.flatten()[:3].tolist())
+    print("         tau1, tau2:", model.feat_n.tau1.item(), model.feat_n.tau2.item())
 
     return model, loss_hist, prices, returns, train_start
