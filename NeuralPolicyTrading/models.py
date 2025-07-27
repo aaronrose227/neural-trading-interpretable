@@ -2,122 +2,106 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ─── 1. InputFeature ────────────────────────────────────────────────────
 class InputFeature(nn.Module):
-    def __init__(self, window_short: int, window_long: int, trainable: bool = False):
+    def __init__(self, window_short: int, window_long: int, trainable: bool):
         super().__init__()
         self.window_short = window_short
         self.window_long  = window_long
 
-        # two linear layers for SMA
+        # 1) EWMA over last window_short points
         self.lin_short = nn.Linear(window_short, 1, bias=True)
+        # 2) SMA over window_long points
         self.lin_long  = nn.Linear(window_long,  1, bias=True)
 
-        # init to exact SMA
-        nn.init.constant_(self.lin_short.weight, 1.0 / window_short)
-        nn.init.constant_(self.lin_short.bias,   0.0)
-        nn.init.constant_(self.lin_long.weight,  1.0 / window_long)
-        nn.init.constant_(self.lin_long.bias,    0.0)
+        # initialize EWMA weights: α = 2/(w+1)
+        α = 2.0 / (window_short + 1.0)
+        # build vector [α*(1-α)^(w-1), ..., α*(1-α)^1, α*(1-α)^0]
+        pow_terms = torch.arange(window_short-1, -1, -1, dtype=torch.float32)
+        w_short = α * (1 - α) ** pow_terms
+        with torch.no_grad():
+            self.lin_short.weight.copy_(w_short.unsqueeze(0))
+            self.lin_short.bias.zero_()
 
-        # if trainable, perturb with N(0,0.05)
-        if trainable:
-            nn.init.normal_(self.lin_short.weight, mean=0.0, std=0.05)
-            nn.init.normal_(self.lin_short.bias,   mean=0.0, std=0.05)
-            nn.init.normal_(self.lin_long.weight,  mean=0.0, std=0.05)
-            nn.init.normal_(self.lin_long.bias,    mean=0.0, std=0.05)
+        # initialize SMA weights: uniform 1/window_long
+        with torch.no_grad():
+            self.lin_long.weight.fill_(1.0 / window_long)
+            self.lin_long.bias.zero_()
 
-        # set requires_grad
-        for p in [self.lin_short.weight, self.lin_short.bias,
-                  self.lin_long.weight,  self.lin_long.bias]:
+        # freeze or unfreeze exactly as requested
+        for p in self.parameters():
             p.requires_grad = trainable
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq_len)
-        # apply each SMA linear to the last window
-        m_short = self.lin_short(x[:, -self.window_short :])
-        m_long  = self.lin_long(x[:, -self.window_long  :])
-        return torch.cat([m_short, m_long], dim=1)  # (batch,2)
+        # x: (batch, window_long)
+        m_tilde = self.lin_short(x[:, -self.window_short :])  # EWMA
+        m       = self.lin_long(x)                            # SMA
+        return torch.cat([m_tilde, m], dim=1)  # (batch,2)
 
-
-# ─── 2. FeatureNet ─────────────────────────────────────────────────────
 class FeatureNet(nn.Module):
-    def __init__(self, tau_init: float = 0.0, trainable: bool = True):
+    def __init__(self, trainable: bool):
         super().__init__()
-        self.tau1 = nn.Parameter(torch.empty(1), requires_grad=trainable)
-        self.tau2 = nn.Parameter(torch.empty(1), requires_grad=trainable)
-        nn.init.normal_(self.tau1, 0.0, 0.05)
-        nn.init.normal_(self.tau2, 0.0, 0.05)
+        # two scalar thresholds τ1, τ2 initialized to zero
+        self.tau1 = nn.Parameter(torch.zeros(()))
+        self.tau2 = nn.Parameter(torch.zeros(()))
+        for p in (self.tau1, self.tau2):
+            p.requires_grad = trainable
 
-    def forward(self, m: torch.Tensor) -> torch.Tensor:
-        # m: (batch,2)
-        w1 = torch.tensor([1.0, -1.0], device=m.device)
-        w2 = torch.tensor([-1.0, 1.0], device=m.device)
-        delta1 = m @ w1 + self.tau1
-        delta2 = m @ w2 + self.tau2
-        o11 = torch.sigmoid(delta1)
-        o12 = torch.sigmoid(delta2)
-        return torch.stack([o11, o12], dim=1)  # (batch,2)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch,2) = [m_tilde, m]
+        d = x[:, :1] - x[:, 1:]
+        o1 = torch.sigmoid(d + self.tau1)
+        o2 = torch.sigmoid(-d + self.tau2)
+        return torch.cat([o1, o2], dim=1)  # (batch,2)
 
-
-# ─── 3. LogicNet ───────────────────────────────────────────────────────
 class LogicNet(nn.Module):
     def __init__(self, trainable: bool = False):
         super().__init__()
-        self.w_nand = nn.Parameter(torch.tensor([-2.0, -2.0]), requires_grad=trainable)
-        self.b_nand = nn.Parameter(torch.tensor( 3.0     ), requires_grad=trainable)
-        self.w_and  = nn.Parameter(torch.tensor([ 2.0,  2.0]), requires_grad=trainable)
-        self.b_and  = nn.Parameter(torch.tensor(-1.5     ), requires_grad=trainable)
-        self.w_nor  = nn.Parameter(torch.tensor([-2.0, -2.0]), requires_grad=trainable)
-        self.b_nor  = nn.Parameter(torch.tensor( 1.0     ), requires_grad=trainable)
+        # exact Boolean‐approximate gates per Eq.(8–10)
+        # NAND: σ(-x1 - x2 + 1.5)
+        self.w_nand = nn.Parameter(torch.tensor([[-1.0, -1.0]]), requires_grad=trainable)
+        self.b_nand = nn.Parameter(torch.tensor([ 1.5   ]), requires_grad=trainable)
+        # AND:  σ( x1 + x2 - 1.5)
+        self.w_and  = nn.Parameter(torch.tensor([[ 1.0,  1.0]]), requires_grad=trainable)
+        self.b_and  = nn.Parameter(torch.tensor([-1.5   ]), requires_grad=trainable)
+        # NOR:  σ(-x1 - x2 + 0.5)
+        self.w_nor  = nn.Parameter(torch.tensor([[-1.0, -1.0]]), requires_grad=trainable)
+        self.b_nor  = nn.Parameter(torch.tensor([ 0.5   ]), requires_grad=trainable)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        l_nand = torch.sigmoid(x @ self.w_nand + self.b_nand)
-        l_and  = torch.sigmoid(x @ self.w_and  + self.b_and)
-        l_nor  = torch.sigmoid(x @ self.w_nor  + self.b_nor)
-        return torch.stack([l_nand, l_and, l_nor], dim=1)  # (batch,3)
+        # x: (batch,2)
+        n = torch.sigmoid(x @ self.w_nand.T + self.b_nand)
+        a = torch.sigmoid(x @ self.w_and .T + self.b_and)
+        r = torch.sigmoid(x @ self.w_nor .T + self.b_nor)
+        return torch.cat([n, a, r], dim=1)  # (batch,3)
 
-
-# ─── 4. PolicyNet ──────────────────────────────────────────────────────
 class PolicyNet(nn.Module):
     def __init__(self, beta: float = 10.0):
         super().__init__()
         self.beta = beta
 
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        return F.softmax(logits * self.beta, dim=1)  # (batch,3)
+        # soft‐argmax with temperature β
+        return F.softmax(logits * self.beta, dim=1)
 
-
-# ─── 5. TradingPolicy ──────────────────────────────────────────────────
 class TradingPolicy(nn.Module):
     def __init__(self,
                  window_short: int,
                  window_long:  int,
                  beta:         float = 10.0,
-                 input_trainable:   bool  = True,   # now always trainable
-                 feature_trainable: bool  = True):  # now always trainable
+                 input_trainable:   bool  = False,
+                 feature_trainable: bool  = False,
+                 logic_trainable:   bool  = False):
         super().__init__()
-        # 1) Build submodules
-        self.input_f = InputFeature(window_short,
-                                    window_long,
-                                    trainable=input_trainable)
+        self.input_f = InputFeature(window_short, window_long, trainable=input_trainable)
         self.feat_n  = FeatureNet(trainable=feature_trainable)
-        # 2) Logic gates are *always* frozen
-        self.logic   = LogicNet(trainable=False)
+        self.logic   = LogicNet(trainable=logic_trainable)
         self.policy  = PolicyNet(beta)
 
-        # 3) Random‐init only the trainable parts
-        for name, param in self.named_parameters():
-            if param.requires_grad and not name.startswith("logic"):
-                nn.init.normal_(param, mean=0.0, std=0.05)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # accept both (batch,window,1) or (batch,window)
         if x.ndim == 3:
             x = x.squeeze(-1)
         f1 = self.input_f(x)
         f2 = self.feat_n(f1)
         f3 = self.logic(f2)
         return self.policy(f3)
-
-
-
-
