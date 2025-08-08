@@ -1,4 +1,4 @@
-# Neural Policy Learning for Interpretable Trading Strategies
+# Neural Policy Learning for Interpretable Trading Strategies (README.md)
 
 Implementation of the paper ["Neural Policy Learning of Interpretable Trading Strategies using Inductive Prior Knowledge"](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3953228) by Krause & Calliess (2021).
 

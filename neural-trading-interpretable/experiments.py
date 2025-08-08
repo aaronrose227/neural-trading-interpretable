@@ -1,4 +1,4 @@
-# main_experiments.py
+# experiments.py
 """
 Main experiments to reproduce paper results with clean output.
 Implements the experimental setup from Section 5 of the paper.
